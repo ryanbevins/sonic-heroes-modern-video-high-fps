@@ -1,6 +1,6 @@
 # Sonic Heroes: Modern Video and High FPS
 
-**Beta (0.2.1-beta).** The features below work in testing, but expect rough edges. Please report bugs on the [Issues](../../issues) page with your resolution, window mode, FPS setting and the stage where it happened.
+**Beta (0.3.0-beta).** The features below work in testing, but expect rough edges. Please report bugs on the [Issues](../../issues) page with your resolution, window mode, FPS setting and the stage where it happened.
 
 A [Reloaded-II](https://github.com/Reloaded-Project/Reloaded-II) mod for the PC version of Sonic Heroes. It adds a **Video** menu where you can change display and graphics settings while the game is running and see the result right away. It can also render above 60 FPS using frame interpolation, while gameplay still runs at the original 60 Hz.
 
@@ -59,13 +59,13 @@ Reloaded-II may offer to download missing dependencies when you enable this mod.
 ## Installation
 
 1. Install Reloaded-II and add Sonic Heroes (`Tsonic_win.exe`).
-2. Download `ModernVideo-0.2.1-beta-Reloaded-II.zip` from [Releases](../../releases).
+2. Download `ModernVideo-0.3.0-beta-Reloaded-II.zip` from [Releases](../../releases).
 3. Drag the `.zip` onto the Reloaded-II window.
 4. Enable **Sonic Heroes: Modern Video and High FPS** and its dependencies for Sonic Heroes, then launch the game through Reloaded-II.
 
 ## Known limitations (beta)
 
-- Frame rates above 60 need V-Sync off.
+- Frame rates above 60 need V-Sync off, except in exclusive fullscreen when the FPS setting equals the refresh rate (for example 240 FPS at 240 Hz).
 - Object shadows and self shadows appear in the menu but are disabled in this beta.
 - Enemy shadows show as "Unavailable" if the graphics setup doesn't support them.
 - It needs the PC `Tsonic_win.exe` with the original game code. Copies that differ only in headers or data, such as the 4GB patch, work. If the code differs, or another mod already hooked the same code, it shows an error naming the problem and stays off instead of patching unknown code.
@@ -87,6 +87,7 @@ The mod is written to `dist\sonicheroes.graphics.modern-video`. Copy that folder
 
 - [Reloaded-II](https://github.com/Reloaded-Project/Reloaded-II) and SH Essentials: Graphics by Sewer56.
 - [SH Essentials: Widescreen Revamp](https://github.com/RaphaelDrewBoltman/sh-widescreen-revamp) by RaphaelDrewBoltman.
+- Frame pacing and thread scheduling improvements by [Cole144](https://github.com/Cole144).
 
 Sonic Heroes is a trademark of SEGA. This project is not affiliated with or endorsed by SEGA.
 

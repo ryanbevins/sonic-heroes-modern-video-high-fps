@@ -2,7 +2,7 @@
   "ModId": "sonicheroes.graphics.modern-video",
   "ModName": "Sonic Heroes: Modern Video and High FPS",
   "ModAuthor": "Ryan",
-  "ModVersion": "0.2.1-beta",
+  "ModVersion": "0.3.0-beta",
   "ModDescription": "Beta. An in-game Video menu (Options > TV icon) with display, graphics and shadow settings, plus higher frame rates through frame interpolation while gameplay stays at the original 60 Hz.",
   "ModNativeDll32": "ModernVideo.dll",
   "ModNativeDll64": "",
