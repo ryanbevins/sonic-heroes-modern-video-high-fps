@@ -525,6 +525,11 @@ bool Replay(const Frame& f,const Matches* matches,float alpha,const ReplayPlan* 
     end();return ok;
 }
 #include "deferred.h"
+// In queue mode the display paces the game: each tick waits until its images have been shown. That is only right
+// when the refresh rate equals the requested image rate. A slower display would slow the game itself (120 FPS on
+// 60 Hz: half speed); a faster one never fills the queue, so the 0.5% fast tick clock would speed the game up.
+// One below covers modes reported as 59/119/239 Hz.
+bool QueueFits(DWORD refresh,unsigned divisions){const DWORD rate=60*divisions;return refresh==rate||refresh+1==rate;}
 bool Synchronized(){
 #ifdef MOTION_TEST
     return false;
@@ -551,7 +556,7 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     const bool unlocked=settings.targetHz==0;
     const unsigned requested=unlocked?0:std::max(1u,settings.targetHz/60);
     bool sync=Synchronized();bool queued=false;
-    if(sync){const auto& pp=Mem<Present8>(0xaa5140);queued=!pp.windowed&&pp.interval==D3DPRESENT_INTERVAL_ONE&&requested>1;
+    if(sync){const auto& pp=Mem<Present8>(0xaa5140);queued=!pp.windowed&&pp.interval==D3DPRESENT_INTERVAL_ONE&&requested>1&&QueueFits(pp.refresh,requested);
         if(!queued){counters.status=NeedVsyncOff;history=false;timing::frame.reasons|=timing::Synchronized;}}
     queuedTick=queued;
     unsigned divisions=requested;double interval=divisions?1.0/(60*divisions):0;

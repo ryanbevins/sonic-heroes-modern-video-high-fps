@@ -437,6 +437,8 @@ void GameCodeTests(){
     exe.resize(0x200000);Check(!game_code::SupportedFile(exe),"truncated executable is rejected");
 }
 int main(){SetUnhandledExceptionFilter(&TestException);
+    Check(QueueFits(240,4)&&QueueFits(239,4)&&QueueFits(120,2)&&QueueFits(119,2),"V-Sync queue mode is used when the refresh rate equals the FPS setting");
+    Check(!QueueFits(60,2)&&!QueueFits(144,4)&&!QueueFits(144,2)&&!QueueFits(240,2)&&!QueueFits(0,2),"V-Sync queue mode is refused when the display would slow or speed up the game");
     GameCodeTests();LoggingTests();IndexTests<uint16_t>(1000,64000);IndexTests<uint32_t>(100000,500000);StreamingCopyTests();VertexMathTests();LayoutTests();TimerTests();
     FrameRates meter;for(int i=0;i<=180;i++)meter.Presented(double(i)/180,i%3==0);
     Check(std::abs(meter.output.At(1)-180)<2.1f&&std::abs(meter.base.At(1)-60)<2.1f,"FPS meter distinguishes 180 submissions from 60 native frames");
