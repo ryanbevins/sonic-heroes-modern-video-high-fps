@@ -706,7 +706,7 @@ bool ResetDisplay(Settings target,bool reverting){
     Present8 pp=reverting?previousPresent:Present();
     if(!reverting){
         RECT client{};GetClientRect(Window(),&client);pp.width=UINT(target.mode==2?target.width:client.right);pp.height=UINT(target.mode==2?target.height:client.bottom);
-        pp.window=Window();pp.windowed=target.mode!=2;pp.format=desktop.Format;pp.count=1;pp.samples=D3DMULTISAMPLE_TYPE(target.aa);
+        pp.window=Window();pp.windowed=target.mode!=2;pp.format=desktop.Format;pp.count=target.mode==2&&target.vsync?2:1; // fullscreen V-Sync: room to queue interpolated imagespp.samples=D3DMULTISAMPLE_TYPE(target.aa);
         pp.swap=target.aa||target.mode==2?D3DSWAPEFFECT_DISCARD:D3DSWAPEFFECT(target.vsync?4:3);
         pp.refresh=target.mode==2?DWORD(target.refresh):0;pp.interval=target.mode==2?(target.vsync?1:0x80000000u):0;
         if(target.aa)pp.flags&=~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;

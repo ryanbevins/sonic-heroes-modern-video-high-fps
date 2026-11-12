@@ -95,7 +95,11 @@ inline HRESULT __stdcall PixelShader(void* d,DWORD value){auto hr=ps(d,value);if
 inline HRESULT __stdcall PixelConstants(void* d,DWORD first,const void* value,DWORD count){auto hr=constants(d,first,value,count);if(SUCCEEDED(hr)&&!recording&&first<=8&&count<=8-first)memcpy(live.psConstants.data()+first,value,count*16);return hr;}
 inline HRESULT __stdcall DeletePixel(void* d,DWORD value){if(!replaying&&!FlushDeferred())return D3DERR_INVALIDCALL;auto hr=deletePs(d,value);if(SUCCEEDED(hr))PixelShaderDeleted(value);return hr;}
 inline HRESULT __stdcall Palette(void* d,DWORD value){auto hr=palette(d,value);if(SUCCEEDED(hr)&&!recording)live.palette=value;return hr;}
-inline HRESULT __stdcall Apply(void* d,DWORD value){PreserveTable keep(d);auto hr=apply(d,value);if(SUCCEEDED(hr))dirty=true;return hr;}
+// An ALL state block captured while the tracked copy was exact puts back exactly that copy, so applying it needs no
+// read-back of every state on the next draw (the restore after each replay, the FPS box, other mods).
+inline std::unordered_map<DWORD,State> blockStates;
+inline HRESULT __stdcall Apply(void* d,DWORD value){PreserveTable keep(d);auto hr=apply(d,value);
+    if(SUCCEEDED(hr)){auto it=blockStates.find(value);if(it!=blockStates.end()&&!recording){live=it->second;dirty=false;}else dirty=true;}return hr;}
 inline std::array<void*,97> beforeRecording{};
 inline Pointer recordLight=nullptr;inline Pair recordEnable=nullptr;
 inline HRESULT __stdcall RecordLight(void* d,DWORD id,const void* value){auto hr=recordLight(d,id,value);if(SUCCEEDED(hr))lightIds.insert(id);return hr;}
@@ -116,11 +120,13 @@ inline HRESULT __stdcall EndBlock(void* d,DWORD* value){
     auto hr=end(d,value);if(SUCCEEDED(hr)){
         auto table=*static_cast<void***>(d);
         for(size_t i=0;i<beforeRecording.size();i++)if(table[i]!=beforeRecording[i])Write(table+i,&beforeRecording[i],4);
-        recording=false;dirty=true;
+        recording=false;dirty=true;if(value)blockStates.erase(*value);
     }return hr;
 }
-inline HRESULT __stdcall CreateBlock(void* d,D3DSTATEBLOCKTYPE type,DWORD* token){PreserveTable keep(d);return create(d,type,token);}
-inline HRESULT __stdcall CaptureBlock(void* d,DWORD token){PreserveTable keep(d);return capture(d,token);}
+inline HRESULT __stdcall CreateBlock(void* d,D3DSTATEBLOCKTYPE type,DWORD* token){PreserveTable keep(d);auto hr=create(d,type,token);
+    if(SUCCEEDED(hr)&&token){if(type==D3DSBT_ALL&&!dirty&&!recording)blockStates[*token]=live;else blockStates.erase(*token);}return hr;}
+inline HRESULT __stdcall CaptureBlock(void* d,DWORD token){PreserveTable keep(d);auto hr=capture(d,token);
+    if(SUCCEEDED(hr)){auto it=blockStates.find(token);if(it!=blockStates.end()){if(!dirty&&!recording)it->second=live;else blockStates.erase(it);}}return hr;}
 template<class F> bool HookSlot(void** table,int i,F next,F& old){if(!Slot(table,i,next,old))return false;hooks.push_back({i,reinterpret_cast<void*>(next),reinterpret_cast<void*>(old)});return true;}
 inline bool Install(void** table){
     dirty=true;hooks.clear();

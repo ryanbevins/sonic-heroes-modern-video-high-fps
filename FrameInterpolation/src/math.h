@@ -77,7 +77,10 @@ inline bool Projection(const Matrix& a,const Matrix& b,float t,Matrix& out,bool 
     if(protect&&(b.m[0][0]/a.m[0][0]<.5f||b.m[0][0]/a.m[0][0]>2||b.m[1][1]/a.m[1][1]<.5f||b.m[1][1]/a.m[1][1]>2))return false;
     for(int i=0;i<4;i++)for(int j=0;j<4;j++){if(!std::isfinite(a.m[i][j])||!std::isfinite(b.m[i][j]))return false;out.m[i][j]=a.m[i][j]+(b.m[i][j]-a.m[i][j])*t;}return true;
 }
-inline uint64_t Hash(const void* data,size_t n,uint64_t h=14695981039346656037ull){auto p=static_cast<const uint8_t*>(data);for(size_t i=0;i<n;i++){h^=p[i];h*=1099511628211ull;}return h;}
+// FNV-1a 64 computed in 32-bit halves: the same result as h*=1099511628211 per byte without a 64-bit multiply,
+// which a Win32 build turns into a call to _allmul for every byte. 1099511628211 = 2^40 + 0x1B3, so
+// h*p = lo*0x1B3 + ((hi*0x1B3 + (lo<<8)) << 32) (mod 2^64).
+inline uint64_t Hash(const void* data,size_t n,uint64_t h=14695981039346656037ull){auto p=static_cast<const uint8_t*>(data);uint32_t lo=uint32_t(h),hi=uint32_t(h>>32);for(size_t i=0;i<n;i++){lo^=p[i];const uint64_t m=uint64_t(lo)*0x1B3u;hi=hi*0x1B3u+uint32_t(m>>32)+(lo<<8);lo=uint32_t(m);}return (uint64_t(hi)<<32)|lo;}
 inline bool Positions(const std::vector<uint8_t>& a,const std::vector<uint8_t>& b,unsigned stride,float t,bool normals,bool protect,std::vector<uint8_t>& out){
     if(stride<12||a.size()!=b.size()||b.size()%stride)return false;out=b;
     // Load/store precisely 12 bytes, including the final tightly packed vertex.
@@ -112,7 +115,7 @@ inline void ReadLockedBytes(void* destination,const void* source,size_t size,boo
 }
 // Merge initialized CPU-written spans; never read WRITEONLY buffers back from GPU.
 struct Shadow {
-    uint64_t generation=0;bool dynamic=false;std::vector<uint8_t> bytes;
+    uint64_t generation=0,writes=0;bool dynamic=false;std::vector<uint8_t> bytes; // writes: Unlock count
     std::vector<std::pair<size_t,size_t>> valid;
     uint8_t* locked=nullptr;size_t offset=0,length=0;bool readonly=false,streaming=false;uintptr_t mirrorPage=~uintptr_t(0);
     void MarkWritten(size_t at,size_t size){
@@ -125,7 +128,7 @@ struct Shadow {
         for(auto span:valid)if(at>=span.first&&at+size<=span.second)return true;return false;
     }
     void Write(size_t at,const void* data,size_t size,bool stream=false){
-        if(at>bytes.size()||size>bytes.size()-at)return;ReadLockedBytes(bytes.data()+at,data,size,stream);MarkWritten(at,size);
+        if(at>bytes.size()||size>bytes.size()-at)return;ReadLockedBytes(bytes.data()+at,data,size,stream);MarkWritten(at,size);++writes;
     }
     bool Read(size_t at,size_t size,std::vector<uint8_t>& out)const{
         if(at>bytes.size()||size>bytes.size()-at)return false;

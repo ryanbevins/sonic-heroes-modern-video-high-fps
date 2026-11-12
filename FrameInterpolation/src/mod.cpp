@@ -32,6 +32,9 @@ bool shuttingDown=false;
 void* device=nullptr;bool replaying=false,capturing=false,installed=false,paired=false,deviceReady=false,pacedTick=false;
 uintptr_t skinOwner=0;bool hudPhase=false;uint64_t generation=0,epoch=0;uintptr_t stage=0;
 double tickStart=0;bool clockValid=false;
+// Exclusive fullscreen with V-Sync on: every image of a tick goes straight into the swap chain's FIFO, which shows
+// one per refresh while the game works on the next tick, so a long tick only shows once it outlasts the queue.
+bool queuedTick=false;
 bool timerActive=false,menuFrame=false;unsigned warmup=0;
 HANDLE pacingTimer=nullptr;bool timerAttempted=false;
 double replayCost=.0005;uint64_t context=0;
@@ -124,13 +127,16 @@ struct Command {
     std::vector<D3DRECT> clearRects;std::vector<RECT> copyRects;std::vector<POINT> points;
     DWORD flags=0,color=0,stencil=0;float z=1;
     uint64_t key=0,layout=0,layoutKey=0;uintptr_t texture=0;std::array<uintptr_t,8> textures{};uintptr_t targetOwner=0,sourceOwner=0;bool scene3d=false,skinned=false,screenSpace=false,canvas=false;
+    // The game's own buffers and draw parameters: a replay of unmoved geometry draws from them as the game did.
+    void* nativeVb=nullptr;void* nativeIb=nullptr;UINT nativeStart=0,nativeMin=0,nativeBase=0;uint64_t vbWrites=0,ibWrites=0;
     void Reuse(){
+        Release(nativeVb);Release(nativeIb);nativeVb=nativeIb=nullptr;nativeStart=nativeMin=nativeBase=0;vbWrites=ibWrites=0;
         Release(target);Release(depth);Release(source);for(auto t:gpu.textures)Release(t);gpu.textures.fill(nullptr);target=depth=source=nullptr;
         kind=Draw;viewport={};world=view=projection={};fvf=0;stride=count=vertices=0;primitive=D3DPT_TRIANGLELIST;
         data.clear();indices.clear();indexFormat=D3DFMT_INDEX16;clearRects.clear();copyRects.clear();points.clear();flags=color=stencil=0;z=1;
         key=layout=layoutKey=0;texture=targetOwner=sourceOwner=0;textures={};scene3d=skinned=screenSpace=canvas=false;
     }
-    ~Command(){if(shuttingDown)return;for(auto t:gpu.textures)Release(t);Release(target);Release(depth);Release(source);}
+    ~Command(){if(shuttingDown)return;Release(nativeVb);Release(nativeIb);for(auto t:gpu.textures)Release(t);Release(target);Release(depth);Release(source);}
 };
 struct Frame {std::vector<std::unique_ptr<Command>> commands;size_t bytes=0;bool valid=true;uint64_t epoch=0;double time=0;};
 Frame previous,current;
@@ -157,7 +163,10 @@ void PixelShaderDeleted(DWORD shader){
     if(uses(current))Invalidate(Unsupported,timing::StateRejected);
     pipeline::dirty=true;
 }
-void ClearHistory(){FlushDeferred();deferCandidate=false;timing::Scope timer(timing::Cleanup);layoutHistory.clear();current=Frame{};previous=Frame{};commandPool.clear();pooledBytes=0;texturesRead.clear();if(restoreToken&&device){D8<56>(device,restoreToken);restoreToken=0;}pipeline::dirty=true;++epoch;warmup=3;}
+// Release the D3D references of captured commands and keep their memory pooled; freeing thousands of large
+// vertex blocks at once took 25 ms on the game thread at the goal ring.
+void Park(Frame& f){for(auto& c:f.commands){c->Reuse();size_t n=Storage(*c);if(commandPool.size()<2048&&n<=FrameBudget-pooledBytes){pooledBytes+=n;commandPool.push_back(std::move(c));}}f=Frame{};}
+void ClearHistory(){FlushDeferred();deferCandidate=false;timing::Scope timer(timing::Cleanup);layoutHistory.clear();for(auto& c:commandPool)c->Reuse();Park(current);Park(previous);texturesRead.clear();if(restoreToken&&device){D8<56>(device,restoreToken);restoreToken=0;}pipeline::dirty=true;++epoch;warmup=3;}
 using TextureLockFn=HRESULT(__stdcall*)(void*,UINT,D3DLOCKED_RECT*,const RECT*,DWORD);
 std::unordered_map<void**,TextureLockFn> textureLocks;
 HRESULT __stdcall TextureLock(void* texture,UINT level,D3DLOCKED_RECT* data,const RECT* rect,DWORD flags){
@@ -181,13 +190,20 @@ std::array<uintptr_t,4> lastTextureMismatch{};
 bool State(Command& c){
     timing::Scope timer(timing::State);
     if(!Targets(c)||!pipeline::Capture(c.gpu))return false;
+    // Only the stages this draw uses are verified and kept: up to the first disabled colour stage, or all 8 with a
+    // pixel shader. The fixed-function pipeline ignores the rest, so they are recorded as empty.
+    DWORD used=8;
+    auto trim=[&](){used=8;if(!c.gpu.ps)for(DWORD i=0;i<8;i++)if(c.gpu.hasTss[i][D3DTSS_COLOROP]&&c.gpu.tss[i][D3DTSS_COLOROP]==D3DTOP_DISABLE){used=i;break;}
+        for(DWORD i=used;i<8;i++)c.gpu.textures[i]=nullptr;};
+    trim();
     for(auto t:c.gpu.textures)Ref(t);
     c.fvf=c.gpu.fvf;c.world=c.gpu.transforms[0];c.view=c.gpu.transforms[1];c.projection=c.gpu.transforms[2];
-    for(DWORD i=0;i<8;i++){void* tex=nullptr;if(SUCCEEDED(D8<60>(device,i,&tex))){if(tex!=c.gpu.textures[i]){
+    for(DWORD i=used;i<8;i++)c.textures[i]=0;
+    for(DWORD i=0;i<used;i++){void* tex=nullptr;if(SUCCEEDED(D8<60>(device,i,&tex))){if(tex!=c.gpu.textures[i]){
             lastTextureMismatch={i,reinterpret_cast<uintptr_t>(c.gpu.textures[i]),reinterpret_cast<uintptr_t>(tex),uintptr_t(current.commands.size())};
             Release(tex);pipeline::dirty=true;timing::frame.reasons|=timing::TextureResync;
             for(auto t:c.gpu.textures)Release(t);c.gpu.textures.fill(nullptr);
-            if(!pipeline::Capture(c.gpu))return false;for(auto t:c.gpu.textures)Ref(t);
+            if(!pipeline::Capture(c.gpu))return false;{DWORD before=used;trim();for(DWORD k=used;k<before;k++)c.textures[k]=0;}for(auto t:c.gpu.textures)Ref(t);
             c.fvf=c.gpu.fvf;c.world=c.gpu.transforms[0];c.view=c.gpu.transforms[1];c.projection=c.gpu.transforms[2];
             tex=nullptr;if(FAILED(D8<60>(device,i,&tex))||tex!=c.gpu.textures[i]){Release(tex);return false;}
         }bool supported=ObserveTexture(tex);void* identity=nullptr;if(tex)D8<0>(tex,&UnknownId,&identity);c.textures[i]=reinterpret_cast<uintptr_t>(identity);Release(identity);Release(tex);if(!supported)return false;}}c.texture=c.textures[0];
@@ -208,6 +224,21 @@ template<class Index> bool IndicesInRange(const std::vector<uint8_t>& data,UINT 
     if(data.size()%sizeof(Index))return false;
     for(size_t i=0;i<data.size();i+=sizeof(Index)){Index value;memcpy(&value,data.data()+i,sizeof(value));if(value>=vertices)return false;}return true;
 }
+// Per-vertex UV identity; FVF strides and offsets are multiples of 4 (anything else takes the byte path).
+bool SameStrided(const uint8_t* a,const uint8_t* b,size_t size,size_t stride,size_t uv){
+    if((stride|uv)&3){for(size_t i=0;i<size;i+=stride)if(memcmp(a+i+uv,b+i+uv,stride-uv))return false;return true;}
+    const size_t words=(stride-uv)/4;
+    for(size_t i=0;i<size;i+=stride){const uint32_t* x=reinterpret_cast<const uint32_t*>(a+i+uv);const uint32_t* y=reinterpret_cast<const uint32_t*>(b+i+uv);uint32_t d=0;for(size_t k=0;k<words;k++)d|=x[k]^y[k];if(d)return false;}
+    return true;
+}
+// Layout identity hash; only compared within a session, so it hashes four bytes at a time.
+uint64_t LayoutHash(const uint8_t* data,size_t size,size_t stride,size_t uv){
+    uint64_t h=14695981039346656037ull;if(uv>=stride)return h;
+    if((stride|uv)&3){for(size_t i=0;i<size;i+=stride)h=Hash(data+i+uv,stride-uv,h);return h;}
+    uint32_t lo=0x811C9DC5u,hi=0x9E3779B9u;const size_t words=(stride-uv)/4;
+    for(size_t i=0;i<size;i+=stride){const uint32_t* x=reinterpret_cast<const uint32_t*>(data+i+uv);for(size_t k=0;k<words;k++){lo=(lo^x[k])*0x01000193u;hi=(hi+x[k])*0x85EBCA6Bu;hi^=hi>>13;}}
+    return (uint64_t(hi)<<32)|lo;
+}
 bool Finalize(Command& c,uint64_t resource,UINT offset){
     if(c.stride<12||c.stride>256||!c.vertices||c.data.size()!=size_t(c.vertices)*c.stride)return false;
     if(c.indices.size()){size_t width=c.indexFormat==D3DFMT_INDEX16?2:c.indexFormat==D3DFMT_INDEX32?4:0;if(!width||c.indices.size()!=size_t(VertexCount(c.primitive,c.count))*width)return false;
@@ -222,9 +253,10 @@ bool Finalize(Command& c,uint64_t resource,UINT offset){
     // x86. Animated positions/colors are deliberately outside the UV identity.
     const auto prior=PriorLayout(c.layoutKey);
     bool same=prior&&prior->stride==c.stride&&prior->fvf==c.fvf&&prior->data.size()==c.data.size()&&prior->indices==c.indices;
-    if(same&&uv<c.stride)for(size_t i=0;i<c.data.size();i+=c.stride)if(memcmp(prior->data.data()+i+uv,c.data.data()+i+uv,c.stride-uv)){same=false;break;}
+    // Unchanged geometry compares in one memcmp; otherwise a word loop instead of a memcmp call per vertex.
+    if(same&&uv<c.stride&&memcmp(prior->data.data(),c.data.data(),c.data.size()))same=SameStrided(prior->data.data(),c.data.data(),c.data.size(),c.stride,uv);
     if(same){c.key=prior->key;c.layout=prior->layout;}
-    else {c.key=Hash(c.indices.data(),c.indices.size(),h);h=14695981039346656037ull;if(uv<c.stride)for(size_t i=0;i<c.data.size();i+=c.stride)h=Hash(c.data.data()+i+uv,c.stride-uv,h);c.layout=h;if(menuFrame)c.key=Hash(&c.layout,sizeof(c.layout),c.key);}
+    else {c.key=Hash(c.indices.data(),c.indices.size(),h);c.layout=LayoutHash(c.data.data(),c.data.size(),c.stride,uv);if(menuFrame)c.key=Hash(&c.layout,sizeof(c.layout),c.key);}
     return Room(c.data.size()+c.indices.size()+sizeof(Command)+c.gpu.lights.size()*sizeof(pipeline::Light));
 }
 void CaptureUP(D3DPRIMITIVETYPE p,UINT count,const void* data,UINT stride,UINT min,UINT vertices,const void* indices,D3DFORMAT format){
@@ -245,10 +277,13 @@ void CaptureVB(D3DPRIMITIVETYPE p,UINT count,UINT start,UINT min,UINT vertices,b
     if(indexed){void* ib=nullptr;ok=SUCCEEDED(D8<86>(device,&ib,&base))&&ib;auto ii=shadows.find(ib);BufferDesc8 desc{};ok=ok&&ii!=shadows.end()&&SUCCEEDED(D8<13>(ib,&desc));
         if(ok){c->indexFormat=desc.format;size_t width=desc.format==D3DFMT_INDEX16?2:desc.format==D3DFMT_INDEX32?4:0;ok=width&&ii->second.Read(size_t(start)*width,size_t(VertexCount(p,count))*width,c->indices);
             if(ok)ok=width==2?RebaseIndices<uint16_t>(c->indices,min,vertices):RebaseIndices<uint32_t>(c->indices,min,vertices);}
+        if(ok){Ref(ib);c->nativeIb=ib;c->ibWrites=ii->second.writes;c->nativeBase=base;c->nativeMin=min;}
         Release(ib);
     }
     size_t offset=(size_t(base)+(indexed?min:start))*stride;
-    ok=ok&&stride>=12&&stride<=256&&size_t(vertices)*stride<=FrameBudget-current.bytes&&it!=shadows.end()&&it->second.Read(offset,size_t(vertices)*stride,c->data);bool dynamic=it!=shadows.end()&&it->second.dynamic;Release(vb);
+    ok=ok&&stride>=12&&stride<=256&&size_t(vertices)*stride<=FrameBudget-current.bytes&&it!=shadows.end()&&it->second.Read(offset,size_t(vertices)*stride,c->data);bool dynamic=it!=shadows.end()&&it->second.dynamic;
+    if(ok&&!dynamic){Ref(vb);c->nativeVb=vb;c->vbWrites=it->second.writes;c->nativeStart=start;}else{Release(c->nativeIb);c->nativeIb=nullptr;}
+    Release(vb);
     // Dynamic allocator offsets are transient. Only unambiguous material/topology
     // matches are accepted; duplicated keys are excluded by Match().
     if(!ok||offset>UINT_MAX){Invalidate(Unsupported,timing::BufferRejected);return;}
@@ -287,12 +322,15 @@ HRESULT __stdcall Copy(void* d,void* source,const RECT* rects,UINT n,void* targe
 }
 // Call at the bottom of the draw-hook chain: all earlier mods have already
 // contributed vertices and state. Re-entering those hooks would filter twice.
-UpFn driverUp=nullptr;IndexedUpFn driverIndexedUp=nullptr;
+UpFn driverUp=nullptr;IndexedUpFn driverIndexedUp=nullptr;DrawFn driverDraw=nullptr;IndexedFn driverIndexed=nullptr;
 using SceneFn=HRESULT(__stdcall*)(void*);SceneFn driverBegin=nullptr,driverEnd=nullptr;
 struct Restore {
     DWORD token=0;void* rt=nullptr;void* ds=nullptr;D3DVIEWPORT9 vp{};
-    bool Capture(){HRESULT depth=D8<33>(device,&ds);HRESULT state=restoreToken?D8<55>(device,restoreToken):D8<57>(device,D3DSBT_ALL,&restoreToken);token=restoreToken;return SUCCEEDED(state)&&SUCCEEDED(D8<32>(device,&rt))&&(SUCCEEDED(depth)||depth==D3DERR_NOTFOUND)&&SUCCEEDED(D8<41>(device,&vp));}
-    ~Restore(){if(rt)D8<31>(device,rt,ds);if(token){D8<54>(device,token);D8<40>(device,&vp);}Release(rt);Release(ds);}
+    // Native replay draws call SetIndices, and d3d8to9 keeps the D3D8 base vertex index in its wrapper, outside
+    // state blocks: put the game's index buffer and base back through SetIndices.
+    void* indices=nullptr;UINT base=0;bool indicesOk=false;
+    bool Capture(){indicesOk=SUCCEEDED(D8<86>(device,&indices,&base));HRESULT depth=D8<33>(device,&ds);HRESULT state=restoreToken?D8<55>(device,restoreToken):D8<57>(device,D3DSBT_ALL,&restoreToken);token=restoreToken;return SUCCEEDED(state)&&SUCCEEDED(D8<32>(device,&rt))&&(SUCCEEDED(depth)||depth==D3DERR_NOTFOUND)&&SUCCEEDED(D8<41>(device,&vp));}
+    ~Restore(){if(indicesOk){D8<85>(device,indices,base);Release(indices);}if(rt)D8<31>(device,rt,ds);if(token){D8<54>(device,token);D8<40>(device,&vp);}Release(rt);Release(ds);}
 };
 using Matches=std::unordered_map<uint64_t,const Command*>;
 Matches Match(const Frame& f){Matches result;for(auto& c:f.commands)if(c->kind==Command::Draw&&c->scene3d){auto p=result.emplace(c->key,c.get());if(!p.second)p.first->second=nullptr;}return result;}
@@ -397,6 +435,8 @@ ReplayPlan PlanReplay(const Frame& f,const Matches& matches,const Frame* before=
     }
     return plan;
 }
+// The game's buffers still hold what was captured (no Unlock since).
+bool NativeCurrent(const Command& c){auto v=shadows.find(c.nativeVb);if(v==shadows.end()||v->second.writes!=c.vbWrites)return false;if(!c.nativeIb)return true;auto i=shadows.find(c.nativeIb);return i!=shadows.end()&&i->second.writes==c.ibWrites;}
 bool Replay(const Frame& f,const Matches* matches,float alpha,const ReplayPlan* prepared=nullptr){
     timing::Scope timer(matches?timing::Replay:timing::Restore);
     Restore restore;if(!restore.Capture())return false;bool inScene=false,ok=true;auto& mixed=mixedScratch;
@@ -431,7 +471,11 @@ bool Replay(const Frame& f,const Matches* matches,float alpha,const ReplayPlan* 
         // Apply final interpolated transforms directly; avoid restoring the
         // native camera and then immediately replacing it for every draw.
         if(!pipeline::ApplyDraw(c.gpu,&world,&camera,&projection)){ok=false;break;}
-        HRESULT hr=c.indices.empty()?driverUp(device,c.primitive,c.count,vertices,c.stride):driverIndexedUp(device,c.primitive,0,c.vertices,c.count,c.indices.data(),c.indexFormat,vertices,c.stride);
+        HRESULT hr;
+        if(c.nativeVb&&vertices==c.data.data()&&NativeCurrent(c)){
+            hr=D8<83>(device,UINT(0),c.nativeVb,c.stride);
+            if(SUCCEEDED(hr))hr=c.nativeIb?(SUCCEEDED(hr=D8<85>(device,c.nativeIb,c.nativeBase))?driverIndexed(device,c.primitive,c.nativeMin,c.vertices,c.nativeStart,c.count):hr):driverDraw(device,c.primitive,c.nativeStart,c.count);
+        }else hr=c.indices.empty()?driverUp(device,c.primitive,c.count,vertices,c.stride):driverIndexedUp(device,c.primitive,0,c.vertices,c.count,c.indices.data(),c.indexFormat,vertices,c.stride);
         if(FAILED(hr)){ok=false;break;}
     }
     end();return ok;
@@ -460,21 +504,24 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     current.time=Now();current.epoch=epoch;
     bool history=previous.valid&&!previous.commands.empty()&&previous.epoch==epoch&&current.time-previous.time<.05;
     if(!history)timing::frame.reasons|=timing::NoHistory;
-    bool sync=Synchronized();if(sync){counters.status=NeedVsyncOff;history=false;timing::frame.reasons|=timing::Synchronized;}
     const bool unlocked=settings.targetHz==0;
     const unsigned requested=unlocked?0:std::max(1u,settings.targetHz/60);
+    bool sync=Synchronized();bool queued=false;
+    if(sync){const auto& pp=Mem<Present8>(0xaa5140);queued=!pp.windowed&&pp.interval==D3DPRESENT_INTERVAL_ONE&&requested>1;
+        if(!queued){counters.status=NeedVsyncOff;history=false;timing::frame.reasons|=timing::Synchronized;}}
+    queuedTick=queued;
     unsigned divisions=requested;double interval=divisions?1.0/(60*divisions):0;
     bool unmatched=false;Matches matches;ReplayPlan plan;
     {timing::Scope timer(timing::Match);if(history){matches=Match(previous);auto currentKeys=Match(current);for(auto& p:currentKeys)if(!p.second)matches.erase(p.first);plan=PlanReplay(current,matches,&previous);if(!plan.usable){history=false;unmatched=true;timing::frame.reasons|=timing::Unmatched;}}}
     replayCost=std::max(.00005,replayCost*.9);
     timing::frame.warmup=warmup;if(warmup){--warmup;history=false;timing::frame.reasons|=timing::Warming;}
-    unsigned images=divisions?divisions-1:0;double first=tickStart+interval,step=interval;
-    if(history&&clockValid&&!unlocked){
+    unsigned images=divisions?divisions-1:0;double first=tickStart+interval,step=interval;const double end=tickStart+1.0/60;
+    if(history&&clockValid&&!unlocked&&!queued){
         // Keep the requested slots when the first one is reachable. A late native
         // frame presents its first image as soon as it can be replayed and spaces
         // the rest evenly up to the native image; alpha follows each image's time.
         // Dropping the whole tick to fewer slots made 180 alternate with 120.
-        const double end=tickStart+1.0/60,ready=Now()+replayCost+.0005;first=std::max(first,ready);
+        const double ready=Now()+replayCost+.0005;first=std::max(first,ready);
         while(images&&(end-first)/images<interval*.75)--images;
         if(images)step=(end-first)/images;
         if(images+1<requested){timing::frame.reasons|=timing::PacingReduced;timing::frame.skipped+=requested-1-images;}
@@ -486,7 +533,7 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
         if(unlocked){
             // No presentation-rate cap. Leave time for the authoritative image
             // and never run simulation more than once per native 60 Hz tick.
-            const double end=tickStart+1.0/60;float lastAlpha=0;
+            float lastAlpha=0;
             while(Now()+replayCost*2+.00025<end){
                 float alpha=float(std::clamp((Now()+replayCost-tickStart)*60,0.0,.999));
                 if(alpha<=lastAlpha)break;
@@ -496,13 +543,23 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
                 if(FAILED(Submit(d,nullptr,nullptr,nullptr,nullptr,false))){ok=false;break;}
                 lastAlpha=alpha;++presented;
             }
+        }else if(queued){
+            // No deadlines: Present waits only while the FIFO is full, and the display paces the images.
+            for(unsigned image=0;image<images;image++){
+                double start=Now();overwritten=true;ok=Replay(current,&matches,float(image+1)/float(divisions),&plan);
+                double cost=Now()-start;replayCost=std::clamp(replayCost*.75+cost*.25,.00005,.02);
+                if(!ok)break;
+                lastPresentation=Now();if(FAILED(Submit(d,nullptr,nullptr,nullptr,nullptr,false))){ok=false;break;}++presented;
+            }
         }else for(unsigned image=0;image<images;image++){
             double deadline=first+image*step;
             if(Now()+replayCost>deadline-.0001||deadline-lastPresentation<interval*.75){++timing::frame.skipped;timing::frame.reasons|=timing::EarlySlotMiss;continue;}
             double start=Now();overwritten=true;ok=Replay(current,&matches,float(std::min(.999,(deadline-tickStart)*60)),&plan);
             double cost=Now()-start;replayCost=std::clamp(replayCost*.75+cost*.25,.00005,.02);
             if(!ok)break;
-            if(Now()>deadline+.0005){++timing::frame.skipped;timing::frame.reasons|=timing::LateReplay;continue;}
+            // A finished image that is late is still shown unless the native image is under half a slot away;
+            // dropping it left a gap of two or more slots for work already done.
+            if(Now()>deadline+.0005&&end-Now()<interval*.5){++timing::frame.skipped;timing::frame.reasons|=timing::LateReplay;continue;}
             Until(deadline);lastPresentation=Now();HRESULT extra=Submit(d,nullptr,nullptr,nullptr,nullptr,false);
             if(FAILED(extra)){ok=false;break;}++presented;
         }
@@ -512,8 +569,8 @@ HRESULT __stdcall Present(void* d,const RECT* src,const RECT* dst,HWND hwnd,cons
     if(needNative){replaying=true;if(!Replay(current,nullptr,1))ok=false;replaying=false;}
     timing::frame.estimateMs=replayCost*1000;if(!ok)timing::frame.reasons|=timing::Failed;
     paired=presented>0&&ok;
-    if(!sync)counters.status=unmatched?Unsupported:paired&&(unlocked||presented+1==requested)?Active:history?TooSlow:Waiting;
-    if(clockValid)Until(tickStart+1.0/60);
+    if(!sync||queued)counters.status=unmatched?Unsupported:paired&&(unlocked||presented+1==requested)?Active:history?TooSlow:Waiting;
+    if(clockValid&&!queued)Until(tickStart+1.0/60);
     HRESULT hr=Submit(d,src,dst,hwnd,dirty,true);
     if(FAILED(hr)){ClearHistory();counters.status=DeviceLost;clockValid=false;}
     else {Recycle(previous);previous=std::move(current);current=Frame{};}
@@ -529,7 +586,7 @@ bool InstallDevice(void* d){
     if(t[15]==reinterpret_cast<void*>(&Present)){deviceReady=true;return true;}
     // Capture before Video Settings installs its later hooks; those hooks still
     // flow through ours, and replay uses the driver functions saved here.
-    driverUp=reinterpret_cast<UpFn>(t[72]);driverIndexedUp=reinterpret_cast<IndexedUpFn>(t[73]);driverBegin=reinterpret_cast<SceneFn>(t[34]);driverEnd=reinterpret_cast<SceneFn>(t[35]);
+    driverUp=reinterpret_cast<UpFn>(t[72]);driverDraw=reinterpret_cast<DrawFn>(t[70]);driverIndexed=reinterpret_cast<IndexedFn>(t[71]);driverIndexedUp=reinterpret_cast<IndexedUpFn>(t[73]);driverBegin=reinterpret_cast<SceneFn>(t[34]);driverEnd=reinterpret_cast<SceneFn>(t[35]);
     bool ok=Slot(t,23,&CreateVB,oldCreateVB)&&Slot(t,24,&CreateIB,oldCreateIB)&&Slot(t,70,&Draw,oldDraw)&&Slot(t,71,&Indexed,oldIndexed)&&Slot(t,72,&Up,oldUp)&&Slot(t,73,&IndexedUp,oldIndexedUp)&&Slot(t,36,&Clear,oldClear)&&Slot(t,28,&Copy,oldCopy)&&Slot(t,29,&UpdateTexture,oldUpdateTexture)&&Slot(t,15,&Present,oldPresent)&&Slot(t,14,&Reset,oldReset);
     ok=ok&&pipeline::Install(t)&&InstallDeferred(t);deviceReady=ok;if(!ok)counters.status=Incompatible;return ok;
 }
@@ -593,7 +650,7 @@ void __cdecl Wait(){
     // frames, FPS 60 and V-Sync. Retail waits on CRI's PulseEvent (0x6c575e); a
     // pulse sent before the wait begins is lost, doubling that frame. The CRI
     // timer and its sound processing keep running; only this wait is replaced.
-    bool paced=tickStart>0;double boundary=tickStart+1.0/60;
+    bool paced=tickStart>0;double boundary=tickStart+(queuedTick?.995:1.0)/60;
     if(paced){
         Timer(true);Until(boundary);
 #ifndef MOTION_TEST
