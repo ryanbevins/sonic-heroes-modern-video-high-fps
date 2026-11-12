@@ -50,15 +50,59 @@ void Timer(bool enable){
 constexpr size_t FrameBudget=96*1024*1024,BufferBudget=128*1024*1024;
 size_t shadowBytes=0;
 double Now(){return timing::Clock();}
+// CRI pins the game thread and its sound threads to CPU 0 ("push 1" before SetThreadAffinityMask at these four
+// sites), the core that takes most interrupt and DPC work. Send them to CPU 2 instead when the PC has one. Runs at
+// mod start, before CRI starts its threads. MMCSS resets the game thread's affinity, so it is set again after.
+DWORD_PTR criMask=0;unsigned affinityTicks=0;
+// Windows' text input (IME / text services) hooks the game's PeekMessage and sometimes waits there on another
+// process (17-23 ms in PeekMessageA at 0x446ee2 on the test PC). Sonic Heroes has no text entry. Both calls apply to
+// every thread of the process and only take effect before the window exists, so this runs at mod start.
+void DisableTextInput(){
+    HMODULE imm=GetModuleHandleW(L"imm32.dll");if(!imm)imm=LoadLibraryW(L"imm32.dll");if(!imm)return;
+    using OffFn=BOOL(WINAPI*)(DWORD);
+    if(auto off=reinterpret_cast<OffFn>(GetProcAddress(imm,"ImmDisableTextFrameService")))off(DWORD(-1));
+    if(auto off=reinterpret_cast<OffFn>(GetProcAddress(imm,"ImmDisableIME")))off(DWORD(-1));
+}
+void MoveCriOffCpu0(){
+    DWORD_PTR process=0,system=0;if(!GetProcessAffinityMask(GetCurrentProcess(),&process,&system)||!(process&4))return;
+    const uintptr_t sites[]={0x6c5215,0x6c5224,0x6c5233,0x6c5241};
+    for(auto at:sites)if(Mem<uint8_t>(at)!=0x6a||Mem<uint8_t>(at+1)!=0x01)return;
+    for(auto at:sites){DWORD old=0;if(VirtualProtect(reinterpret_cast<void*>(at+1),1,PAGE_EXECUTE_READWRITE,&old)){Mem<uint8_t>(at+1)=4;VirtualProtect(reinterpret_cast<void*>(at+1),1,old,&old);}}
+    FlushInstructionCache(GetCurrentProcess(),reinterpret_cast<void*>(0x6c5215),0x40);criMask=4;
+}
+// The game thread joins Windows' multimedia scheduler (MMCSS task "Games"), which raises its current priority above
+// 15 most of the time. Any SetThreadPriority call cancels that boost, so the wait below changes priority only while
+// the thread is not boosted.
+bool schedulingReady=false,restorePending=false;HANDLE mmcssTask=nullptr;int basePriority=THREAD_PRIORITY_NORMAL;
+int CurrentPriority(){
+    using QueryFn=LONG(WINAPI*)(HANDLE,int,void*,ULONG,ULONG*);
+    static auto query=reinterpret_cast<QueryFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtQueryInformationThread"));
+    struct {LONG exitStatus;void* teb;void* process;void* thread;ULONG_PTR affinity;LONG priority;LONG base;} info{}; // THREAD_BASIC_INFORMATION
+    return query&&query(GetCurrentThread(),0,&info,sizeof info,nullptr)>=0?int(info.priority):0;
+}
+bool Boosted(){return mmcssTask&&CurrentPriority()>15;}
+void SetupScheduling(){ // first tick, on the game thread
+    schedulingReady=true;HANDLE self=GetCurrentThread();
+    SetThreadPriority(self,THREAD_PRIORITY_ABOVE_NORMAL);basePriority=THREAD_PRIORITY_ABOVE_NORMAL;
+    for(uintptr_t at:{uintptr_t(0xad2dfc),uintptr_t(0xad2dc8)})if(HANDLE server=Mem<HANDLE>(at))SetThreadPriority(server,THREAD_PRIORITY_TIME_CRITICAL); // CRI's two sound servers
+    using AvSetFn=HANDLE(WINAPI*)(LPCWSTR,LPDWORD);
+    if(HMODULE avrt=LoadLibraryW(L"avrt.dll"))if(auto set=reinterpret_cast<AvSetFn>(GetProcAddress(avrt,"AvSetMmThreadCharacteristicsW"))){DWORD index=0;mmcssTask=set(L"Games",&index);}
+    if(criMask)SetThreadAffinityMask(self,criMask);
+}
 void Until(double target){
     timing::Scope timer(timing::Wait);
     // CRI pins the game thread to CPU 0 and disables its priority boost. At
     // normal priority it wakes behind whatever took CPU 0 while it slept,
     // often a full quantum late. Raise priority only while blocked; the final
     // spin, game and CRI code keep their original priorities.
-    HANDLE self=GetCurrentThread();const int priority=GetThreadPriority(self);
+    // While MMCSS boosts the thread, leave its priority alone (a SetThreadPriority call would cancel the boost); a
+    // restore that fell into a boosted period is done at the next wait.
+    HANDLE self=GetCurrentThread();
+    if(restorePending&&!Boosted()){SetThreadPriority(self,basePriority);restorePending=false;}
+    const int priority=restorePending?basePriority:GetThreadPriority(self);
     const bool raise=priority!=THREAD_PRIORITY_ERROR_RETURN&&priority<THREAD_PRIORITY_TIME_CRITICAL;
-    auto block=[&](auto wait){bool raised=raise&&SetThreadPriority(self,THREAD_PRIORITY_TIME_CRITICAL);bool woke=wait();if(raised)SetThreadPriority(self,priority);return woke;};
+    auto block=[&](auto wait){bool raised=raise&&!Boosted()&&SetThreadPriority(self,THREAD_PRIORITY_TIME_CRITICAL);bool woke=wait();
+        if(raised){if(Boosted())restorePending=true;else SetThreadPriority(self,priority);}return woke;};
     for(;;){double remain=target-Now();if(remain<=0)break;
         // Relative high-resolution timer for the coarse portion; QPC spin for
         // the final half millisecond. Keep a compatible Sleep fallback.
@@ -644,6 +688,10 @@ using HudFn=void(__stdcall*)(void*);HudFn oldHud=nullptr;
 void __stdcall Hud(void* action){hudPhase=true;oldHud(action);}
 void __cdecl Wait(){
 #ifndef MOTION_TEST
+    if(!schedulingReady)SetupScheduling(); // reads CRI's thread handles in the game
+    else if(criMask&&++affinityTicks%600==0)SetThreadAffinityMask(GetCurrentThread(),criMask);
+#endif
+#ifndef MOTION_TEST
     if(installed&&Mem<void*>(0x8e0be8)!=device)InstallDevice(Mem<void*>(0x8e0be8));
 #endif
     // Every tick after the first uses our 60 Hz clock, including native-only
@@ -687,6 +735,7 @@ extern "C" __declspec(dllexport) const motion::Api* __cdecl HeroesMotionApi(uint
 extern "C" __declspec(dllexport) void __cdecl ReloadedStart(){
     using namespace fi;static bool started=false;if(started)return;started=true;
     if(GetModuleHandleW(nullptr)!=reinterpret_cast<HMODULE>(0x400000)||!KnownExe()){counters.status=Incompatible;return;}
+    MoveCriOffCpu0();DisableTextInput();
     const uint8_t call[]={0xe8,0x52,0x1e,0x28,0}; // 443169 -> 6c4fc0
     if(memcmp(reinterpret_cast<void*>(0x443169),call,5)){counters.status=Incompatible;return;}
     const uint8_t menuCall[]={0xe8,0xae,0,0,0}; // 40552d -> 4055e0, EDI object
