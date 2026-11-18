@@ -167,6 +167,7 @@ struct Command {
     pipeline::State gpu;void* dev=nullptr;void* target=nullptr;void* depth=nullptr;void* source=nullptr;
     D3DVIEWPORT9 viewport{};Matrix world{},view{},projection{};
     DWORD fvf=0;UINT stride=0,count=0,vertices=0;D3DPRIMITIVETYPE primitive=D3DPT_TRIANGLELIST;
+    DWORD vs=0,vsCount=0;std::array<float,64> vsConstants{}; // registered vertex shader and its recorded constants
     std::vector<uint8_t> data,indices;D3DFORMAT indexFormat=D3DFMT_INDEX16;
     std::vector<D3DRECT> clearRects;std::vector<RECT> copyRects;std::vector<POINT> points;
     DWORD flags=0,color=0,stencil=0;float z=1;
@@ -176,7 +177,7 @@ struct Command {
     void Reuse(){
         Release(nativeVb);Release(nativeIb);nativeVb=nativeIb=nullptr;nativeStart=nativeMin=nativeBase=0;vbWrites=ibWrites=0;
         Release(target);Release(depth);Release(source);for(auto t:gpu.textures)Release(t);gpu.textures.fill(nullptr);target=depth=source=nullptr;
-        kind=Draw;viewport={};world=view=projection={};fvf=0;stride=count=vertices=0;primitive=D3DPT_TRIANGLELIST;
+        kind=Draw;viewport={};world=view=projection={};fvf=0;stride=count=vertices=0;primitive=D3DPT_TRIANGLELIST;vs=vsCount=0;
         data.clear();indices.clear();indexFormat=D3DFMT_INDEX16;clearRects.clear();copyRects.clear();points.clear();flags=color=stencil=0;z=1;
         key=layout=layoutKey=0;texture=targetOwner=sourceOwner=0;textures={};scene3d=skinned=screenSpace=canvas=false;
     }
@@ -251,6 +252,11 @@ bool State(Command& c){
             c.fvf=c.gpu.fvf;c.world=c.gpu.transforms[0];c.view=c.gpu.transforms[1];c.projection=c.gpu.transforms[2];
             tex=nullptr;if(FAILED(D8<60>(device,i,&tex))||tex!=c.gpu.textures[i]){Release(tex);return false;}
         }bool supported=ObserveTexture(tex);void* identity=nullptr;if(tex)D8<0>(tex,&UnknownId,&identity);c.textures[i]=reinterpret_cast<uintptr_t>(identity);Release(identity);Release(tex);if(!supported)return false;}}c.texture=c.textures[0];
+    // A registered shader reads its FVF layout: record its constants for the replay.
+    c.vs=c.vsCount=0;
+    if(const auto* shader=pipeline::Registered(c.fvf)){
+        if(FAILED(D8<80>(device,DWORD(0),c.vsConstants.data(),shader->count)))return false;
+        c.vs=c.fvf;c.vsCount=shader->count;c.fvf=shader->fvf;}
     // D3D8 shader handles use bit 0. CPU skinning in retail Heroes uses FVF XYZ.
     if((c.fvf&1)||((c.fvf&D3DFVF_POSITION_MASK)!=D3DFVF_XYZ&&(c.fvf&D3DFVF_POSITION_MASK)!=D3DFVF_XYZRHW))return false;
     c.screenSpace=(c.fvf&D3DFVF_POSITION_MASK)==D3DFVF_XYZRHW;
@@ -515,6 +521,10 @@ bool Replay(const Frame& f,const Matches* matches,float alpha,const ReplayPlan* 
         // Apply final interpolated transforms directly; avoid restoring the
         // native camera and then immediately replacing it for every draw.
         if(!pipeline::ApplyDraw(c.gpu,&world,&camera,&projection)){ok=false;break;}
+        // A registered shader gets its constants for this image's transforms from its owner.
+        if(c.vs){const auto* shader=pipeline::Registered(c.vs);if(!shader||shader->count!=c.vsCount){ok=false;break;}
+            auto constants=c.vsConstants;shader->constants(c.vs,&world.m[0][0],&camera.m[0][0],&projection.m[0][0],constants.data(),c.vsCount);
+            if(FAILED(D8<79>(device,DWORD(0),constants.data(),c.vsCount))){ok=false;break;}}
         HRESULT hr;
         if(c.nativeVb&&vertices==c.data.data()&&NativeCurrent(c)){
             hr=D8<83>(device,UINT(0),c.nativeVb,c.stride);
@@ -737,6 +747,15 @@ bool Jump(uintptr_t address,void* to,size_t n,uint8_t op=0xe9){std::vector<uint8
 bool KnownExe(){return game_code::Supported();}
 }
 extern "C" __declspec(dllexport) const motion::Api* __cdecl HeroesMotionApi(uint32_t version){return version==motion::Abi&&fi::installed?&fi::api:nullptr;}
+// Lets another mod's vertex shader be interpolated: handle (D3D8 shader handle: odd, or bit 31 from d3d8to9), fvf (the fixed-function layout of
+// the vertices it reads, XYZ position), count (constant registers 0..count-1, at most 16) and constants (called for
+// each replayed draw with that image's world, view and projection, row-major; updates the recorded constants in
+// place). constants == nullptr removes the shader. Returns 1 when accepted.
+extern "C" __declspec(dllexport) int __cdecl HeroesMotionRegisterShader(DWORD handle,DWORD fvf,DWORD count,fi::pipeline::ShaderConstants constants){
+    if(!fi::pipeline::ShaderHandle(handle)||!count||count>16||fi::pipeline::ShaderHandle(fvf)||(fvf&D3DFVF_POSITION_MASK)!=D3DFVF_XYZ)return 0;
+    if(!constants){fi::pipeline::shaders.erase(handle);return 1;}
+    fi::pipeline::shaders[handle]={fvf,count,constants};return 1;
+}
 extern "C" __declspec(dllexport) void __cdecl ReloadedStart(){
     using namespace fi;static bool started=false;if(started)return;started=true;
     if(GetModuleHandleW(nullptr)!=reinterpret_cast<HMODULE>(0x400000)||!KnownExe()){counters.status=Incompatible;return;}

@@ -20,4 +20,8 @@ struct Api {
     void (__cdecl* overlay)(Overlay);
 };
 using GetApi=const Api* (__cdecl*)(uint32_t);
+// Optional export HeroesMotionRegisterShader: a mod whose vertex shader's constants follow the fixed-function
+// transforms registers it, and replays ask it for each image's constants.
+using ShaderConstants=void(__cdecl*)(uint32_t handle,const float* world,const float* view,const float* projection,float* constants,uint32_t count);
+using RegisterShader=int(__cdecl*)(uint32_t handle,uint32_t fvf,uint32_t count,ShaderConstants constants);
 }

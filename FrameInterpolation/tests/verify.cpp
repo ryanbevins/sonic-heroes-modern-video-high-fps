@@ -238,6 +238,52 @@ void ViewportReplayTests(){
     Check(Replay(current,nullptr,1)&&Pixels()==native,"viewport change within retained frame reconstructs native pixels");replaying=false;
     D3DVIEWPORT9 restored{};D8<41>(device,&restored);Check(!memcmp(&full,&restored,sizeof(full)),"viewport optimization restores the caller viewport");ClearHistory();
 }
+// A vertex shader registered through HeroesMotionRegisterShader (GameCube Features draws Grand Metropolis this way):
+// captured with its constants, replayed with constants its owner computes from the replay's transforms.
+int shaderCalls=0;float shaderShift=0;Matrix shaderWorld{};
+void __cdecl FixtureShaderConstants(DWORD handle,const float* world,const float* view,const float* projection,float* constants,DWORD count){
+    ++shaderCalls;memcpy(&shaderWorld,world,sizeof(Matrix));if(!(handle&1)||count!=4)return;
+    Matrix w,v,p;memcpy(&w,world,sizeof w);memcpy(&v,view,sizeof v);memcpy(&p,projection,sizeof p);
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++){float a=0;for(int k=0;k<4;k++){float b=0;for(int l=0;l<4;l++)b+=w.m[j][l]*v.m[l][k];a+=b*p.m[k][i];}constants[4*i+j]=a;}
+    constants[3]+=shaderShift;
+}
+void VertexShaderTests(){
+    // vs.1.1: dp4 oPos.xyzw, v0, c0..c3; mov oD0, v5. Declaration: v0 float3, v5 D3DCOLOR.
+    const DWORD declaration[]={0x20000000,0x40020000,0x40040005,0xFFFFFFFF};
+    const DWORD program[]={0xFFFE0101,9,0xC0010000,0x90E40000,0xA0E40000,9,0xC0020000,0x90E40000,0xA0E40001,9,0xC0040000,0x90E40000,0xA0E40002,
+        9,0xC0080000,0x90E40000,0xA0E40003,1,0xD00F0000,0x90E40005,0x0000FFFF};
+    DWORD shader=0;Check(SUCCEEDED(D8<75>(device,declaration,program,&shader,DWORD(0)))&&(shader&1),"create D3D8 vertex shader fixture (handle bit 0)");
+    const DWORD layout=D3DFVF_XYZ|D3DFVF_DIFFUSE;
+    Check(!HeroesMotionRegisterShader(shader&~DWORD(1),layout,4,&FixtureShaderConstants)&&!HeroesMotionRegisterShader(shader,layout,0,&FixtureShaderConstants)
+        &&!HeroesMotionRegisterShader(shader,layout,17,&FixtureShaderConstants)&&!HeroesMotionRegisterShader(shader,D3DFVF_XYZRHW|D3DFVF_DIFFUSE,4,&FixtureShaderConstants),
+        "shader registration refuses non-handles, no or too many constants and pre-projected layouts");
+    Check(HeroesMotionRegisterShader(0x80123450,layout,4,&FixtureShaderConstants)==1&&pipeline::Registered(0x80123450)&&!pipeline::Registered(0x00123450)
+        &&HeroesMotionRegisterShader(0x80123450,layout,4,nullptr)==1&&!pipeline::Registered(0x80123450),"d3d8to9 shader handles (bit 31) register too");
+    Matrix unit=Identity(),lens{};lens.m[0][0]=lens.m[1][1]=lens.m[2][2]=lens.m[2][3]=1;lens.m[3][2]=-.1f;
+    struct V{float x,y,z;DWORD color;};const V quad[]={{-.5f,-.5f,1,0xffff4020},{.5f,-.5f,1,0xffff4020},{-.5f,.5f,1,0xffff4020},{.5f,.5f,1,0xffff4020}};
+    auto frame=[&](){
+        ClearHistory();deferCandidate=false;capturing=true;hudPhase=false;menuFrame=false;
+        D8<36>(device,DWORD(0),static_cast<const D3DRECT*>(nullptr),DWORD(D3DCLEAR_TARGET|D3DCLEAR_ZBUFFER),DWORD(0xff202020),1.f,DWORD(0));
+        D8<34>(device);D8<50>(device,D3DRS_ZENABLE,DWORD(FALSE));D8<50>(device,D3DRS_ALPHABLENDENABLE,DWORD(FALSE));D8<50>(device,D3DRS_CULLMODE,DWORD(D3DCULL_NONE));
+        D8<37>(device,D3DTS_WORLD,&unit);D8<37>(device,D3DTS_VIEW,&unit);D8<37>(device,D3DTS_PROJECTION,&lens);
+        float constants[16];FixtureShaderConstants(shader,&unit.m[0][0],&unit.m[0][0],&lens.m[0][0],constants,4);
+        D8<79>(device,DWORD(0),constants,DWORD(4));D8<76>(device,shader);
+        D8<72>(device,D3DPT_TRIANGLESTRIP,UINT(2),quad,UINT(sizeof(V)));
+        D8<76>(device,layout);D8<35>(device);capturing=false;
+    };
+    frame();Check(!current.valid,"unregistered vertex shader still leaves the frame unreplayed");
+    Check(HeroesMotionRegisterShader(shader,layout,4,&FixtureShaderConstants)==1,"register vertex shader with its layout and constant count");
+    frame();auto native=Pixels();
+    Check(current.valid&&current.commands.size()==2&&current.commands[1]->vs==shader&&current.commands[1]->fvf==layout&&current.commands[1]->vsCount==4
+        &&current.commands[1]->gpu.fvf==shader&&current.commands[1]->vsConstants[0]==1&&current.commands[1]->vsConstants[11]==-.1f,"registered shader draw captured with its layout and constants");
+    replaying=true;shaderCalls=0;
+    Check(Replay(current,nullptr,1)&&Pixels()==native&&shaderCalls==1&&!memcmp(&shaderWorld,&unit,sizeof unit),"registered shader replay asks its owner for constants and is pixel identical");
+    shaderShift=.25f;Check(Replay(current,nullptr,1)&&Pixels()!=native,"replayed shader draws with the constants its owner returns");
+    shaderShift=0;Check(Replay(current,nullptr,1)&&Pixels()==native,"owner constants restore the native image");replaying=false;
+    Check(HeroesMotionRegisterShader(shader,layout,4,nullptr)==1&&!pipeline::Registered(shader),"shader registration removed");
+    DWORD active=0;D8<77>(device,&active);Check(active==layout,"fixed-function layout restored after shader replay");
+    D8<50>(device,D3DRS_CULLMODE,DWORD(D3DCULL_CCW));D8<78>(device,shader);ClearHistory();
+}
 uint64_t PixelShaderTests(bool deferred=false){
     // ps_1_1: mov r0, c0. Constant changes must remain distinct in replay.
     const DWORD program[]={D3DPS_VERSION(1,1),D3DSIO_MOV,0x800f0000,0xa0e40000,D3DSIO_END};
@@ -544,7 +590,7 @@ int main(){SetUnhandledExceptionFilter(&TestException);
     auto menuFixture=[&](float x){current=Frame{};capturing=true;menuFrame=true;hudPhase=false;Matrix unit=Identity();D8<37>(d,D3DTS_WORLD,&unit);D8<37>(d,D3DTS_VIEW,&unit);D8<37>(d,D3DTS_PROJECTION,&unit);D8<50>(d,D3DRS_ZENABLE,DWORD(FALSE));D8<76>(d,Fvf);D8<36>(d,DWORD(0),static_cast<const D3DRECT*>(nullptr),DWORD(D3DCLEAR_TARGET),DWORD(0xff101010),1.f,DWORD(0));D8<34>(d);Vertex triangle[]={{x-.3f,-.3f,.5f,0,0,-1,0xff00ffff},{x+.3f,-.3f,.5f,0,0,-1,0xff00ffff},{x,.3f,.5f,0,0,-1,0xff00ffff}};D8<72>(d,D3DPT_TRIANGLELIST,UINT(1),triangle,UINT(sizeof(Vertex)));D8<35>(d);capturing=false;};
     ClearHistory();menuFixture(-.3f);previous=std::move(current);menuFixture(.3f);uint64_t menuCurrent=Pixels();auto menuMatches=Match(previous);settings.camera=settings.geometry=0;replaying=true;Check(current.commands[1]->canvas&&SupportedMotion(*previous.commands[1],*current.commands[1]),"orthographic menu geometry is eligible independently of gameplay toggles");
     Check(Replay(current,&menuMatches,1.f/3)&&Pixels()!=menuCurrent,"native menu geometry renders a real intermediate image");Check(Replay(current,nullptr,1)&&Pixels()==menuCurrent,"menu replay restores exact native current frame");replaying=false;menuFrame=false;settings.camera=settings.geometry=1;ClearHistory();
-    auto nativeMenu=TexturedMenuTests();Check(TexturedMenuTests(true)==nativeMenu,"deferred textured menu matches independently rendered native pixels");ViewportReplayTests();BufferMirrorTests();auto nativeShader=PixelShaderTests();Check(PixelShaderTests(true)==nativeShader,"deferred pixel-shaded geometry matches independently rendered native pixels");DeferredTests();ActionMenuTests();GameplayPrefixTests();DuplicatePairingTests();DuplicateMotionTests();
+    auto nativeMenu=TexturedMenuTests();Check(TexturedMenuTests(true)==nativeMenu,"deferred textured menu matches independently rendered native pixels");ViewportReplayTests();BufferMirrorTests();VertexShaderTests();auto nativeShader=PixelShaderTests();Check(PixelShaderTests(true)==nativeShader,"deferred pixel-shaded geometry matches independently rendered native pixels");DeferredTests();ActionMenuTests();GameplayPrefixTests();DuplicatePairingTests();DuplicateMotionTests();
     void* texture=nullptr;Check(SUCCEEDED(D8<20>(d,UINT(4),UINT(4),UINT(1),DWORD(0),D3DFMT_A8R8G8B8,D3DPOOL_MANAGED,&texture)),"create mutable effect texture");Check(ObserveTexture(texture),"observe texture write boundary");capturing=true;current.valid=true;D3DLOCKED_RECT texLock{};Check(SUCCEEDED(D8<16>(texture,UINT(0),&texLock,static_cast<const RECT*>(nullptr),DWORD(0))),"native effect texture writes remain permitted");D8<17>(texture,UINT(0));Check(!capturing&&!current.valid&&counters.status==Unsupported,"texture rewritten after an earlier draw rejects replay");Release(texture);
     replaying=false;capturing=false;Release(vb);Release(ib);vb=ib=nullptr;ClearHistory();D8<83>(d,UINT(0),static_cast<void*>(nullptr),UINT(0));D8<85>(d,static_cast<void*>(nullptr),UINT(0));
     Check(SUCCEEDED(D8<14>(d,&pp)),"device Reset releases retained frames and stateblocks");Check(previous.commands.empty()&&current.commands.empty()&&!clockValid,"reset invalidates all interpolation history");

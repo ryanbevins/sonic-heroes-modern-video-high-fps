@@ -17,6 +17,15 @@ struct State {
     std::array<std::array<float,4>,8> psConstants{};
 };
 inline State live;inline bool dirty=true,recording=false;
+// Vertex shaders registered by another mod (HeroesMotionRegisterShader): their constants follow the fixed-function
+// transforms, so a replay with in-between transforms asks the owner for that image's constants. fvf: the vertex
+// layout the shader reads (positions, UVs and colours are matched and interpolated as for that FVF).
+using ShaderConstants=void(__cdecl*)(DWORD handle,const float* world,const float* view,const float* projection,float* constants,DWORD count);
+struct Shader {DWORD fvf=0,count=0;ShaderConstants constants=nullptr;};
+inline std::unordered_map<DWORD,Shader> shaders;
+// D3D8 handles: odd values from the D3D8 runtime, bit 31 set from d3d8to9; FVF codes have neither.
+inline bool ShaderHandle(DWORD handle){return (handle&1)||(handle&0x80000000u);}
+inline const Shader* Registered(DWORD handle){if(!ShaderHandle(handle))return nullptr;auto it=shaders.find(handle);return it==shaders.end()?nullptr:&it->second;}
 inline std::unordered_set<DWORD> lightIds{0,1,2,3,4,5,6,7};
 inline int TransformIndex(DWORD type){return type==D3DTS_WORLD?0:type==D3DTS_VIEW?1:type==D3DTS_PROJECTION?2:type>=16&&type<24?int(type)-13:-1;}
 inline DWORD TransformType(int index){return index==0?D3DTS_WORLD:index==1?D3DTS_VIEW:index==2?D3DTS_PROJECTION:DWORD(index+13);}
@@ -133,7 +142,7 @@ inline bool Install(void** table){
     return HookSlot(table,50,&RenderState,rs)&&HookSlot(table,63,&TextureState,tss)&&HookSlot(table,37,&Transform,transform)&&HookSlot(table,39,&Multiply,multiply)&&HookSlot(table,42,&SetMaterial,material)&&HookSlot(table,44,&SetLight,light)&&HookSlot(table,46,&EnableLight,enable)&&HookSlot(table,48,&Clip,clip)&&HookSlot(table,61,&SetTexture,texture)&&HookSlot(table,76,&VertexShader,vs)&&HookSlot(table,88,&PixelShader,ps)&&HookSlot(table,91,&PixelConstants,constants)&&HookSlot(table,90,&DeletePixel,deletePs)&&HookSlot(table,68,&Palette,palette)&&HookSlot(table,54,&Apply,apply)&&HookSlot(table,52,&BeginBlock,begin)&&HookSlot(table,53,&EndBlock,end)&&HookSlot(table,55,&CaptureBlock,capture)&&HookSlot(table,57,&CreateBlock,create);
 }
 inline bool Capture(State& state){
-    if(!Sync()||(live.fvf&1)||live.rs[D3DRS_VERTEXBLEND]||live.rs[D3DRS_INDEXEDVERTEXBLENDENABLE])return false;
+    if(!Sync()||((live.fvf&1)&&!Registered(live.fvf))||live.rs[D3DRS_VERTEXBLEND]||live.rs[D3DRS_INDEXEDVERTEXBLENDENABLE])return false;
     // Pixel shaders affect shading, not CPU-skinned geometry correspondence.
     // D3D8 has eight float4 PS constants. Read actual values for shaded draws,
     // including native code using previously cached driver setter pointers.
